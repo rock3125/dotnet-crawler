@@ -15,15 +15,20 @@ sudo pacman -S dotnet-sdk-8.0
 ```powershell
 
 # modern Windows servers
+#
 winget install Microsoft.DotNet.AspNetCore.8
-
-# older Windows servers (e.g. Windows 2016, download dotnet core 8)
-
 # desktop instead use: 
 # winget install Microsoft.DotNet.DesktopRuntime.8
 
 # and always install the runtime
 winget install Microsoft.DotNet.Runtime.8
+
+# or download the SDK and RunTime from Microsoft
+#
+# sdk
+https://dotnet.microsoft.com/en-us/download/dotnet/thank-you/sdk-8.0.317-windows-x64-installer
+# runtime
+https://dotnet.microsoft.com/en-us/download/dotnet/thank-you/runtime-8.0.20-windows-x64-installer
 
 # verifiy installation
 dotnet --list-runtimes
@@ -43,6 +48,12 @@ cd src/Crawlers/bin/Release/net8.0/
 
 # to run see run from console below
 ```
+
+## Cache file location
+The default cache file location on Windows is `C:\ProgramData\Console\` for running the crawler from the command line, and
+`C:\ProgramData\{service-name}\` for running this program as a service.  You can delete these cache files any time after
+the program has stopped running.  This ProgramData folder is probably invisible or mapped on most Windows versions, just
+navigate to this folder by typing the path into explorer.
 
 ## run
 This code has been designed to run as a Windows-Service or as a command-line utility.
@@ -102,3 +113,20 @@ Crawlers /debug -server http://localhost:8080/api -crawler file -org xxxxxxxx-xx
 
 ![Runtime View](images/5.png "Runtime View")
 
+
+### Utilities and Development tools
+Install VS Code after you've installed Dotnet 8
+
+```shell
+# visual studio code
+https://code.visualstudio.com/download
+
+# install C# Dev Kit (Microsoft) by opening any C# file
+https://git-scm.com/downloads/win
+
+# clone this repository
+git clone git@github.com:simsage/dotnet-crawler.git
+
+cd dotnet-crawler
+dotnet restore
+```

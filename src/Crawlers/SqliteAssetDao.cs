@@ -3,8 +3,12 @@ namespace Crawlers;
 using Microsoft.EntityFrameworkCore;
 using System;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Security.AccessControl; // From the NuGet package
+using System.Security.Principal;
 
-    public class SqliteAssetDao : IDisposable
+public class SqliteAssetDao : IDisposable
     {
         private static readonly RockLogger Logger = RockLogger.GetLogger(typeof(SqliteAssetDao));
         private CachedAssetDbContext DbContext { get; }
@@ -12,12 +16,18 @@ using System.Linq;
 
         public SqliteAssetDao(string serviceName)
         {
-            // Define your cache database file path
+            // Define your cache database file path - set by unit tests only
             if (string.IsNullOrEmpty(CacheDatabasePath))
             {
+                // this path is C:\ProgramData\<service_name>\crawler_cache.db
                 var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
                 var serviceDataPath = Path.Combine(appDataPath, serviceName);
-                Directory.CreateDirectory(serviceDataPath); // Ensure directory exists
+                if (!Directory.Exists(serviceDataPath)) {
+                    Directory.CreateDirectory(serviceDataPath); // Ensure directory exists
+                    if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
+                        EnsureFolderPermissions(serviceDataPath);
+                    }
+                }
                 CacheDatabasePath = Path.Combine(serviceDataPath, "crawler_cache.db");
             }
             DbContext = new CachedAssetDbContext(CacheDatabasePath);
@@ -28,6 +38,29 @@ using System.Linq;
             CacheDatabasePath = databasePath;
             DbContext = new CachedAssetDbContext(CacheDatabasePath);
         }
+
+        [SupportedOSPlatform("windows")]
+        private void EnsureFolderPermissions(string folderPath)
+        {
+            var dInfo = new DirectoryInfo(folderPath);
+            
+            // In .NET 8, these are provided by FileSystemAclExtensions
+            // But you can usually call them directly on dInfo if the package is installed
+            DirectorySecurity dSecurity = dInfo.GetAccessControl();
+            
+            var usersGroup = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+            
+            var rule = new FileSystemAccessRule(
+                usersGroup,
+                FileSystemRights.Modify, 
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                PropagationFlags.None,
+                AccessControlType.Allow);
+            
+            dSecurity.AddAccessRule(rule);
+            dInfo.SetAccessControl(dSecurity);
+        }
+
 
         /// <summary>
         /// Ensures the database is created and any pending migrations are applied.
@@ -164,7 +197,7 @@ using System.Linq;
             }
             catch (Exception ex)
             {
-                Logger.Error($"Set() {ex.Message}");
+                Logger.Error($"Set() {ex.Message} {ex.InnerException}");
             }
         }
 

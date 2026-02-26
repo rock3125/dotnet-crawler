@@ -56,24 +56,22 @@ public class MicrosoftFileShareCrawler : ICrawler
     public bool Run()
     {
         _logger.Info($"{_name}: file crawler starting");
-        Test(); // make sure we can connect before starting
-
         var parameters = GetParameters();
 
-        var newDelta = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
         // get AD information if set up
-        var (users, groups) = SetupAdUsersAndGroups(parameters);
-        _adUsers = users;
-        _adGroups = groups;
+        try
+        {
+            var (users, groups) = SetupAdUsersAndGroups(parameters);
+            _adUsers = users;
+            _adGroups = groups;
+        }
+        catch
+        {
+            return false; // connection to AD failed
+        }
 
-        // do it
-        if (!CrawlDirectory(_shareStartPath, 0))
-            return false;
-
-        _api?.SetDeltaState(newDelta.ToString());
-
-        return true;
+        // do it and return the exit status
+        return CrawlDirectory(_shareStartPath, 0);
     }
 
     public void SetDeltaState(string deltaState)
@@ -104,9 +102,7 @@ public class MicrosoftFileShareCrawler : ICrawler
         string Username,
         string Password,
         bool UseAd,
-        string AdServer,
         string AdPath,
-        string Domain,
         bool UseSsl
     );
 
@@ -146,22 +142,19 @@ public class MicrosoftFileShareCrawler : ICrawler
         // Check if the user wants to use an active directory (optional)
         var useAd = (_propertyMap.TryGetValue("useAD", out var useAdObj) ? useAdObj.ToString() ?? "false" : "false")
             .ToLowerInvariant().Trim() == "true";
-        var adServer = _propertyMap.TryGetValue("activeServer", out var adServerObj)
-            ? adServerObj.ToString() ?? ""
-            : "";
         var useSsl =
             (_propertyMap.TryGetValue("useSSL", out var useSslObj) ? useSslObj.ToString() ?? "false" : "false")
             .ToLowerInvariant().Trim() == "true";
-        var domain = _propertyMap.TryGetValue("domain", out var domainObj) ? domainObj.ToString() ?? "." : ".";
         var adPath = _propertyMap.TryGetValue("adPath", out var adPathObj) ? adPathObj.ToString() ?? "" : "";
 
         if (useAd)
         {
-            _api.VerifyParameters(_name, _propertyMap, ["activeServer", "domain", "adPath", "username", "password"]);
+            _api.VerifyParameters(_name, _propertyMap, ["adPath", "username", "password"]);
         }
 
-        return new CrawlerParameterSet(username, password, useAd, adServer, adPath, domain, useSsl);
+        return new CrawlerParameterSet(username, password, useAd, adPath, useSsl);
     }
+
 
     /// <summary>
     /// read the AD users and groups?
@@ -180,25 +173,33 @@ public class MicrosoftFileShareCrawler : ICrawler
             _logger.Info($"{_name}: Connecting to active directories...");
             try
             {
-                var ldapServer = parameters.UseSsl
-                    ? $"ldaps://{parameters.AdServer}:636"
-                    : $"ldap://{parameters.AdServer}:389";
-                var reader = new LdapReader(ldapServer, parameters.Username, parameters.Password);
-                foreach (var group in reader.GetAllGroups())
-                {
-                    adGroups[group.DisplayName] = group;
-                }
-
+                var reader = new LdapReader(parameters.AdPath, parameters.UseSsl, parameters.Username, parameters.Password);
+                var groupUserResolver = new Dictionary<string, LdapUser>();
+                var groupGroupResolver = new Dictionary<string, LdapGroup>();
                 foreach (var user in reader.GetAllUsers())
                 {
-                    adUser[user.Email] = user;
+                    adUser[user.Identity.ToLower()] = user;
+                    groupUserResolver[user.DistinguishedName.ToLower()] = user;
                 }
+                foreach (var group in reader.GetAllGroups())
+                {
+                    adGroups[group.Identity.ToLower()] = group;
+                    groupGroupResolver[group.DistinguishedName.ToLower()] = group;
+                }
+                foreach (var group in CreateDomainGroups())
+                {
+                    adGroups[group.Identity.ToLower()] = group;
+                    groupGroupResolver[group.DistinguishedName.ToLower()] = group;
+                }
+
+                // fix the group memberships - flatten the groups
+                reader.ResolveGroups(adGroups.Values.ToList(), groupUserResolver, groupGroupResolver);
             }
             catch
             {
                 _logger.Error(
                     $@"{_name}: cannot connect to Active Directory
-                 (serverIP={parameters.AdServer},username={parameters.Username},secure={parameters.UseSsl},domain={parameters.Domain},adPath={parameters.AdPath})"
+                 (username={parameters.Username},secure={parameters.UseSsl},adPath={parameters.AdPath})"
                 );
                 throw; // Re-throw to indicate a critical setup failure
             }
@@ -220,10 +221,13 @@ public class MicrosoftFileShareCrawler : ICrawler
     /// <param name="recursionDepth">starts at 0, how deep we are in the directory structure</param>
     private bool CrawlDirectory(string currentDirectory, int recursionDepth)
     {
+        if (recursionDepth > 100)
+            return true; // prevent infinite recursion
+
         try
         {
             // Process files in the current directory
-            foreach (var filePath in Directory.GetFiles(currentDirectory))
+            foreach (var filePath in GetFilesForFolder(currentDirectory))
             {
                 if (!ProcessFile(filePath))
                     return false;
@@ -232,7 +236,7 @@ public class MicrosoftFileShareCrawler : ICrawler
             }
 
             // Recursively process subdirectories
-            foreach (var subDirectory in Directory.GetDirectories(currentDirectory))
+            foreach (var subDirectory in GetDirectoriesForFolder(currentDirectory))
             {
                 if (!CrawlDirectory(subDirectory, recursionDepth + 1))
                     return false;
@@ -244,24 +248,24 @@ public class MicrosoftFileShareCrawler : ICrawler
         {
             _logger.Error($"{_name}: Access denied to directory {currentDirectory}: {ex.Message}");
             if (recursionDepth == 0)
-                return false;
+                return true;
         }
         catch (DirectoryNotFoundException ex)
         {
             _logger.Error($"{_name}: Directory not found: {currentDirectory}: {ex.Message}");
             if (recursionDepth == 0)
-                return false;
+                return true;
         }
-        catch
+        catch (Exception ex)
         {
-            _logger.Error($"{_name}: An unexpected error occurred while crawling directory {currentDirectory}");
-            return false;
+            _logger.Error($"{_name}: An unexpected error occurred while crawling directory {currentDirectory}", ex);
+            return true;
         }
 
         return Active;
     }
 
-    
+
     /// <summary>
     /// process a single file
     /// </summary>
@@ -271,52 +275,93 @@ public class MicrosoftFileShareCrawler : ICrawler
     {
         if (_api == null || _api.HasExceededCapacity())
             return true;
-        
+
         var asset = new Asset();
-        try
+        var retry = false;
+        do
         {
-            FileInfo fileInfo = new FileInfo(filePath);
-            FileMetadata metadata = new FileMetadata
+            try
             {
-                FilePath = filePath,
-                FileSize = fileInfo.Length,
-                LastWriteTime = fileInfo.LastWriteTime,
-                CreatedTime = fileInfo.CreationTime
-            };
+                retry = false;
+                var fileInfo = new FileInfo(filePath);
+                var metadata = new FileMetadata
+                {
+                    FilePath = filePath,
+                    FileSize = fileInfo.Length,
+                    LastWriteTime = fileInfo.LastWriteTime,
+                    CreatedTime = fileInfo.CreationTime
+                };
 
-            _logger.Debug($"{_name} Processing file: {filePath}");
+                _logger.Debug($"{_name} Processing file: {filePath}");
 
-            // Get ACL information
-            metadata.AccessControlList = GetFileAccessControlInfo(filePath);
+                // Get ACL information
+                metadata.AccessControlList = GetFileAccessControlInfo(filePath);
 
-            // convert this Samba data into one of our assets
-            asset = ConvertToAsset(metadata);
-            if (_api != null)
-            {
-                return _api.ProcessAsset(asset);
+                // convert this Samba data into one of our assets
+                asset = ConvertToAsset(metadata);
+                if (_api != null)
+                {
+                    if (_api.LastModifiedHasChanged(asset))
+                    {
+                        try
+                        {
+                            asset.Filename = DownloadAssetData(asset, metadata);
+                            if (asset.Filename != "")
+                            {
+                                return _api.ProcessAsset(asset);
+                            }
+                        }
+                        finally
+                        {
+                            if (asset.Filename != "")
+                            {
+                                File.Delete(asset.Filename);
+                            }
+                        }
+                    }
+                }
+
             }
-        }
-        catch (FileNotFoundException)
-        {
-            _logger.Error($"{_name}: File not found: {filePath}. It might have been moved or deleted.");
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            _logger.Error($"{_name}: Access denied to file {filePath}: {ex.Message}");
-        }
-        catch
-        {
-            _logger.Error($"{_name}: An unexpected error occurred while processing file {filePath}");
-            return false;
-        }
-        finally
-        {
-            // remove temp file
-            if (asset.Filename.Length > 0)
+            catch (FileNotFoundException ex)
             {
-                File.Delete(asset.Filename);
+                _api?.RecordAssetException(asset, $"File not found: {filePath}", ex);
+                _logger.Error($"{_name}: File not found: {filePath}. It might have been moved or deleted.");
             }
-        }
+            catch (UnauthorizedAccessException ex)
+            {
+                _api?.RecordAssetException(asset, $"Access denied to file {filePath}", ex);
+                _logger.Error($"{_name}: Access denied to file {filePath}: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                if (PlatformCrawlerCommonProxy.IsNetWorkError(ex))
+                {
+                    // can't log - just write to console
+                    Console.WriteLine($"cannot ProcessFile {filePath} over the network, trying again in {PlatformCrawlerCommonProxy.WaitForNetworkErrorTimeoutInSeconds} seconds.");
+                    retry = true;
+                }
+                else
+                {
+                    _api?.RecordAssetException(asset, $"An unexpected error occurred while processing file {filePath}", ex);
+                    _logger.Error($"{_name}: An unexpected error occurred while processing file {filePath}");
+                }
+            }
+            finally
+            {
+                // remove temp file
+                if (asset.Filename.Length > 0)
+                {
+                    File.Delete(asset.Filename);
+                }
+            }
+
+            // keep trying until the system comes back online
+            if (retry)
+            {
+                Thread.Sleep(PlatformCrawlerCommonProxy.WaitForNetworkErrorTimeoutInSeconds * 1000);
+            }
+
+        } while (retry);
 
         return true;
     }
@@ -325,27 +370,42 @@ public class MicrosoftFileShareCrawler : ICrawler
     /// <summary>
     /// Downloads a file from the share to the local download directory.
     /// </summary>
+    /// <param name="asset">The asset holder.</param>
     /// <param name="sourceFilePath">The full path of the file on the share.</param>
-    private string DownloadFile(string sourceFilePath)
+    private string DownloadFile(Asset asset, string sourceFilePath)
     {
-        try
+        var retry = false;
+        do
         {
-            var filename = FileUtils.GetTempFilename();
-            File.Copy(sourceFilePath, filename, true); // 'true' to overwrite if this file already exists
-            return filename;
-        }
-        catch (IOException ex)
-        {
-            _logger.Debug($"{_name}: Error downloading {sourceFilePath} (e.g., file in use, network issue): {ex.Message}");
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            _logger.Debug($"{_name}: Permission denied to download {sourceFilePath}: {ex.Message}");
-        }
-        catch
-        {
-            _logger.Debug($"{_name}: An unexpected error occurred during download of {sourceFilePath}");
-        }
+            try
+            {
+                retry = false;
+                var filename = FileUtils.GetTempFilename();
+                File.Copy(sourceFilePath, filename, true); // 'true' to overwrite if this file already exists
+                return filename;
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _api?.RecordAssetException(asset, $"Permission denied to download {sourceFilePath}", ex);
+                _logger.Debug($"{_name}: Permission denied to download {sourceFilePath}: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                if (PlatformCrawlerCommonProxy.IsNetWorkError(ex))
+                {
+                    // can't log - just write to console
+                    Console.WriteLine($"cannot DownloadFile {sourceFilePath} over the network, trying again in {PlatformCrawlerCommonProxy.WaitForNetworkErrorTimeoutInSeconds} seconds.");
+                    retry = true;
+                }
+            }
+
+            // keep trying until the system comes back online
+            if (retry)
+            {
+                Thread.Sleep(PlatformCrawlerCommonProxy.WaitForNetworkErrorTimeoutInSeconds * 1000);
+            }
+
+        } while (retry);
 
         return "";
     }
@@ -353,6 +413,7 @@ public class MicrosoftFileShareCrawler : ICrawler
     
     /// <summary>
     /// get all the required details of an SmbFile and put it inside a crawler document
+    /// do not download the file's data yet, as we need to see if it has changed or not
     /// </summary>
     /// <param name="item">the file being processed</param>
     /// <returns>the crawler document containing all the required metadata</returns>
@@ -366,27 +427,43 @@ public class MicrosoftFileShareCrawler : ICrawler
         var fileExtension = Document.GetFileExtension(asset.Url);
         var mimetype = FileUtils.FileTypeToMimeType(fileExtension);
         asset.MimeType = mimetype;
-        asset.Acls.AddRange(ConvertAcls(item));
+        asset.Acls.AddRange(ConvertAcls(item.AccessControlList, _adUsers, _adGroups));
 
         asset.Metadata[Document.META_LAST_MODIFIED_DATE_TIME] = item.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss", _formatter);
         asset.LastModified = ToUnixEpochMilliseconds(item.LastWriteTime);
         asset.Metadata[Document.META_CREATED_DATE_TIME] = item.CreatedTime.ToString("yyyy-MM-dd HH:mm:ss", _formatter);
         asset.Created = ToUnixEpochMilliseconds(item.CreatedTime);
-
-        // asset.LastModified >= _deltaTimeTca
-        if (item.FileSize > 0L)
-        {
-            // only download the file if we need to
-            if (_api != null && !_api.IsInventoryOnly(mimetype))
-            {
-                // Download the file
-                asset.Filename = DownloadFile(item.FilePath);
-            }
-            asset.BinarySize = item.FileSize;
-        }
+        asset.BinarySize = item.FileSize;
 
         return asset;
     }
+
+
+    /// <summary>
+    /// Downloads asset data for the provided file metadata if specific conditions are met.
+    /// and return the local temporary filename for the data (or empty string if we don't download it)
+    /// </summary>
+    /// <param name="asset">The document holder / information.</param>
+    /// <param name="item">The metadata of the file to be downloaded.</param>
+    /// <returns>A string representing the downloaded file path, or an empty string if the file is not downloaded.</returns>
+    private string DownloadAssetData(Asset asset, FileMetadata item)
+    {
+        if (item.FileSize <= 0L)
+        {
+            _api?.RecordAssetException(asset, "File empty", null);
+            return "";
+        }
+
+        // only download the file if we need to
+        if (_api != null && !_api.IsInventoryOnly(asset))
+        {
+            // Download the file
+            return DownloadFile(asset, item.FilePath);
+        }
+
+        return "";
+    }
+
 
     /// <summary>
     /// Converts a DateTime to Unix epoch (seconds since 1970-01-01 00:00:00 UTC).
@@ -412,122 +489,164 @@ public class MicrosoftFileShareCrawler : ICrawler
     private List<AccessControlEntry> GetFileAccessControlInfo(string filePath)
     {
         List<AccessControlEntry> aclEntries = new List<AccessControlEntry>();
-        try
+        var retry = false;
+        do
         {
-            var fileInfo = new FileInfo(filePath);
-            var fileSecurity = fileInfo.GetAccessControl();
-
-            // Get access rules, including inherited ones, for SecurityIdentifier objects
-            foreach (FileSystemAccessRule rule in fileSecurity.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            try
             {
-                AccessControlEntry ace = new AccessControlEntry
-                {
-                    FileSystemRights = rule.FileSystemRights.ToString(),
-                    AccessControlType = rule.AccessControlType.ToString(),
-                    IsInherited = rule.IsInherited
-                };
+                retry = false;
+                var fileInfo = new FileInfo(filePath);
+                var fileSecurity = fileInfo.GetAccessControl();
 
-                // Attempt to translate the SecurityIdentifier (SID) to an NTAccount (Domain\User or Domain\Group)
-                try
+                // Get access rules, including inherited ones, for SecurityIdentifier objects
+                foreach (FileSystemAccessRule rule in fileSecurity.GetAccessRules(true, true, typeof(SecurityIdentifier)))
                 {
-                    NTAccount ntAccount = (NTAccount)rule.IdentityReference.Translate(typeof(NTAccount));
-                    SecurityIdentifier sid = (SecurityIdentifier)rule.IdentityReference;
-                    ace.Identity = ntAccount.Value;
+                    AccessControlEntry ace = new AccessControlEntry
+                    {
+                        FileSystemRights = rule.FileSystemRights.ToString(),
+                        AccessControlType = rule.AccessControlType.ToString(),
+                        IsInherited = rule.IsInherited
+                    };
 
-                    // Basic heuristic to determine if it's likely a user or group.
-                    // A definitive determination requires querying Active Directory for the objectClass.
-                    if (sid.IsWellKnown(WellKnownSidType.BuiltinUsersSid) ||
-                        sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) ||
-                        sid.IsWellKnown(WellKnownSidType.BuiltinGuestsSid) ||
-                        sid.IsWellKnown(WellKnownSidType.BuiltinPowerUsersSid) ||
-                        sid.IsWellKnown(WellKnownSidType.NetworkServiceSid) ||
-                        sid.IsWellKnown(WellKnownSidType.LocalSystemSid) ||
-                        sid.IsWellKnown(WellKnownSidType.AuthenticatedUserSid) ||
-                        sid.IsWellKnown(WellKnownSidType.CreatorOwnerSid) ||
-                        sid.IsWellKnown(WellKnownSidType.WorldSid) ||
-                        sid.IsWellKnown(WellKnownSidType.LocalServiceSid) ||
-                        sid.IsWellKnown(WellKnownSidType.NetworkSid))
+                    // Attempt to translate the SecurityIdentifier (SID) to an NTAccount (Domain\User or Domain\Group)
+                    try
                     {
-                        ace.Type = "Well-Known";
-                    }
-                    else if (ace.Identity.EndsWith("$")) // Common for machine accounts
-                    {
-                        ace.Type = "Machine";
-                    }
-                    else if (ace.Identity.Contains("\\"))
-                    {
-                        // If it contains a domain, it's likely a domain user or group.
-                        // Without AD lookup, we can't definitively say user vs group.
-                        // We'll mark it as needing AD lookup for full details.
-                        ace.Type = "Domain";
-                    }
-                    else
-                    {
-                        ace.Type = "Local";
-                    }
+                        NTAccount ntAccount = (NTAccount)rule.IdentityReference.Translate(typeof(NTAccount));
+                        SecurityIdentifier sid = (SecurityIdentifier)rule.IdentityReference;
+                        ace.Identity = ntAccount.Value;
 
-                    aclEntries.Add(ace);
+                        // Basic heuristic to determine if it's likely a user or group.
+                        // A definitive determination requires querying Active Directory for the objectClass.
+                        if (sid.IsWellKnown(WellKnownSidType.BuiltinUsersSid) ||
+                            sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) ||
+                            sid.IsWellKnown(WellKnownSidType.BuiltinGuestsSid) ||
+                            sid.IsWellKnown(WellKnownSidType.BuiltinPowerUsersSid) ||
+                            sid.IsWellKnown(WellKnownSidType.NetworkServiceSid) ||
+                            sid.IsWellKnown(WellKnownSidType.LocalSystemSid) ||
+                            sid.IsWellKnown(WellKnownSidType.AuthenticatedUserSid) ||
+                            sid.IsWellKnown(WellKnownSidType.CreatorOwnerSid) ||
+                            sid.IsWellKnown(WellKnownSidType.WorldSid) ||
+                            sid.IsWellKnown(WellKnownSidType.LocalServiceSid) ||
+                            sid.IsWellKnown(WellKnownSidType.NetworkSid))
+                        {
+                            ace.Type = "Well-Known";
+                        }
+                        else if (ace.Identity.EndsWith("$")) // Common for machine accounts
+                        {
+                            ace.Type = "Machine";
+                        }
+                        else if (ace.Identity.Contains("\\"))
+                        {
+                            // If it contains a domain, it's likely a domain user or group.
+                            // Without AD lookup, we can't definitively say user vs group.
+                            // We'll mark it as needing AD lookup for full details.
+                            ace.Type = "Domain";
+                        }
+                        else
+                        {
+                            ace.Type = "Local";
+                        }
 
-                }
-                catch (IdentityNotMappedException)
-                {
-                    // This occurs if the SID cannot be translated to an NTAccount (e.g., orphaned SID)
-                    ace.Identity = rule.IdentityReference.Value; // Use the raw SID value
-                    ace.Type = "Unresolved SID";
-                }
-                catch
-                {
-                    // Catch any other errors during SID translation
-                    _logger.Warn($"Error translating SID {rule.IdentityReference.Value}");
+                        aclEntries.Add(ace);
+
+                    }
+                    catch (IdentityNotMappedException)
+                    {
+                        // This occurs if the SID cannot be translated to an NTAccount (e.g., orphaned SID)
+                        ace.Identity = rule.IdentityReference.Value; // Use the raw SID value
+                        ace.Type = "Unresolved SID";
+                    }
+                    catch
+                    {
+                        // Catch any other errors during SID translation
+                        _logger.Warn($"Error translating SID {rule.IdentityReference.Value}");
+                    }
                 }
             }
-        }
-        catch (UnauthorizedAccessException)
-        {
-            _logger.Error($"  Access denied to read ACL for {filePath}. You may need higher permissions.");
-        }
-        catch
-        {
-            _logger.Error($"  Error getting ACL for {filePath}");
-        }
+            catch (UnauthorizedAccessException)
+            {
+                _logger.Error($"Access denied to read ACL for {filePath}. You may need higher permissions.");
+            }
+            catch (Exception ex)
+            {
+                if (PlatformCrawlerCommonProxy.IsNetWorkError(ex))
+                {
+                    // can't log - just write to console
+                    Console.WriteLine($"cannot GetFileAccessControlInfo {filePath} over the network, trying again in {PlatformCrawlerCommonProxy.WaitForNetworkErrorTimeoutInSeconds} seconds.");
+                    retry = true;
+                }
+            }
+
+            // keep trying until the system comes back online
+            if (retry)
+            {
+                Thread.Sleep(PlatformCrawlerCommonProxy.WaitForNetworkErrorTimeoutInSeconds * 1000);
+            }
+
+        } while (retry);
+
         return aclEntries;
     }
 
 
     /// <summary>
-    /// convert the security principals for a file
+    /// convert the security principals of files
     /// </summary>
-    /// <param name="item">the item to get ACLs for</param>
+    /// <param name="accessControlList">the ACLs to convert</param>
+    /// <param name="adUsers">a dictionary of available users for translation of ACLs</param>
+    /// <param name="adGroups">a dictionary of avaialble groups for translation of ACLs</param>
     /// <returns>a set of ACLs</returns>
-    private List<AssetAcl> ConvertAcls(FileMetadata item)
+    public static List<AssetAcl> ConvertAcls(
+        List<AccessControlEntry> accessControlList,
+        Dictionary<string, LdapUser> adUsers,
+        Dictionary<string, LdapGroup> adGroups
+        )
     {
         var assetAclList = new List<AssetAcl>();
-        item.AccessControlList.ForEach(ace =>
+        accessControlList.ForEach(ace =>
         {
-            if (ace.Type != "Domain" && ace.Type != "Local")
+            if (ace.Type == "Well-Known" && adGroups.ContainsKey(ace.Identity.ToLower()))
+            {
+                // these shall pass
+            }
+            else if (ace.Type != "Domain" && ace.Type != "Local")
+            {
                 return; // Continue to the next ACE
+            }
+            if (ace.AccessControlType != "Allow")
+            {
+                return; // not allowed to access
+            }
 
             const bool write = false;
             const bool delete = false;
 
             AssetAcl? acl = null;
-            if (_adUsers.TryGetValue(ace.Email.Trim().ToLowerInvariant(), out var user))
+            if (adUsers.TryGetValue(ace.Identity.Trim().ToLowerInvariant(), out var user))
             {
-                var email = ace.Email;
-                var givenName = user.DisplayName;
-                if (!string.IsNullOrEmpty(email) && !string.IsNullOrEmpty(givenName))
+                if (!string.IsNullOrEmpty(user.Email))
                 {
+                    var email = user.Email;
+                    var samAccount = user.SamAccountName;
+                    if (samAccount.Length > 1)
+                    {
+                        samAccount = char.ToUpper(samAccount[0]) + samAccount.Substring(1).ToLower();
+                    } else {
+                        samAccount = samAccount.ToUpper();
+                    }
+                    var displayName = (user.DisplayName == "") ? samAccount : user.DisplayName;
                     acl = new AssetAcl(
-                        email,
-                        givenName,
+                        name: email,
+                        displayName,
                         AssetAcl.CreateAccessString(read: true, write: write, delete: delete)
                     );
                 }
             }
-            else if (_adGroups.TryGetValue(ace.Identity.Trim(), out var group))
+            else if (adGroups.TryGetValue(ace.Identity.Trim().ToLowerInvariant(), out var group))
             {
+                var displayName = (group.DisplayName == "") ? group.SamAccountName : group.DisplayName;
                 acl = new AssetAcl(
-                    group.DisplayName,
+                    displayName,
                     AssetAcl.CreateAccessString(read: true, write: write, delete: delete),
                     group.Members
                 );
@@ -540,6 +659,111 @@ public class MicrosoftFileShareCrawler : ICrawler
         });
         return assetAclList;
     }
+
+    /// <summary>
+    /// helper: create a list of domain groups to use for standard AD group mapping
+    /// </summary>
+    /// <returns>a list of LdapGroups that are domain well known groups</returns>
+    private List<LdapGroup> CreateDomainGroups() 
+    {
+        var domainGroupList = new List<LdapGroup>
+        {
+            new()
+            {
+                DistinguishedName = "Users",
+                SamAccountName = "Users",
+                DisplayName = "Users",
+                Identity = "builtin\\users"
+            },
+            new()
+            {
+                DistinguishedName = "Administrators",
+                SamAccountName = "Administrators",
+                DisplayName = "Administrators",
+                Identity = "builtin\\administrators"
+            }
+        };
+        return domainGroupList;
+    }
+
+
+    /////////////////////////////////////////////////////////////////////////////////////////////
+    /// network failure resilient helpers
+
+    /// <summary>
+    /// Get the files inside a given folder - keep trying if the network is down
+    /// </summary>
+    /// <param name="currentDirectory"></param>
+    /// <returns></returns>
+    private static string[] GetFilesForFolder(string currentDirectory)
+    {
+        var retry = false;
+        do
+        {
+            try
+            {
+                retry = false;
+                return Directory.GetFiles(currentDirectory);
+
+            }
+            catch (Exception ex)
+            {
+                if (PlatformCrawlerCommonProxy.IsNetWorkError(ex))
+                {
+                    // can't log - just write to console
+                    Console.WriteLine($"the file-share is not reachable over the network, trying again in {PlatformCrawlerCommonProxy.WaitForNetworkErrorTimeoutInSeconds} seconds.");
+                    retry = true;
+                }
+            }
+
+            // keep trying until the system comes back online
+            if (retry)
+            {
+                Thread.Sleep(PlatformCrawlerCommonProxy.WaitForNetworkErrorTimeoutInSeconds * 1000);
+            }
+
+        } while (retry);
+        return [];
+    }
+
+
+    /// <summary>
+    /// Get the directories inside a given folder - keep trying if the network is down
+    /// </summary>
+    /// <param name="currentDirectory"></param>
+    /// <returns></returns>
+    private static string[] GetDirectoriesForFolder(string currentDirectory)
+    {
+        var retry = false;
+        do
+        {
+            try
+            {
+                retry = false;
+                return Directory.GetDirectories(currentDirectory);
+
+            }
+            catch (Exception ex)
+            {
+                if (PlatformCrawlerCommonProxy.IsNetWorkError(ex))
+                {
+                    // can't log - just write to console
+                    Console.WriteLine($"the file-share is not reachable over the network, trying again in {PlatformCrawlerCommonProxy.WaitForNetworkErrorTimeoutInSeconds} seconds.");
+                    retry = true;
+                }
+            }
+
+            // keep trying until the system comes back online
+            if (retry)
+            {
+                Thread.Sleep(PlatformCrawlerCommonProxy.WaitForNetworkErrorTimeoutInSeconds * 1000);
+            }
+
+        } while (retry);
+        return [];
+    }
+
+
 
     public string StateToJson() => ""; // Not implemented, returning empty string as per Kotlin
     public void StateFromJson(string json) { } // Not implemented
